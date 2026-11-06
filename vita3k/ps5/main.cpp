@@ -20,6 +20,11 @@
 
 #include "archive.h"
 #include "frontend/frontend.h"
+#ifdef EMUHUB_EMBEDDED_VITA
+#include "emuhub_handoff.h"
+#include <miniz.h>
+#include <set>
+#endif
 
 #include <app/functions.h>
 #include <app/session_controller.h>
@@ -70,6 +75,22 @@ extern "C" int sceKernelUsleep(unsigned int microseconds);
 
 namespace {
 
+#ifdef EMUHUB_EMBEDDED_VITA
+constexpr const char *EMUHUB_FRONTEND = "/app0/es-de/es-de.bin";
+constexpr const char *EMUHUB_TICKET = "/app0/config/vita-request.txt";
+constexpr const char *EMUHUB_MARKER = "/app0/config/vita-request.txt.once";
+std::optional<emuhub_vita::Request> active_emuhub_request;
+constexpr const char *THIS_EXECUTABLE = "/app0/providers/vita/eboot.bin";
+[[noreturn]] void return_to_emuhub_now() {
+    std::fflush(nullptr);
+    const char *const arguments[] = { nullptr };
+    const int refused = sceSystemServiceLoadExec(EMUHUB_FRONTEND, arguments);
+    std::fprintf(stderr, "Vita provider: frontend return refused 0x%X\n", static_cast<unsigned>(refused));
+    for (;;) sceKernelUsleep(100000);
+}
+#else
+constexpr const char *THIS_EXECUTABLE = "/app0/eboot.bin";
+#endif
 constexpr const char *BOOT_ARGUMENT = "--boot";
 // With --boot, where the app is when it is not installed: its folder on USB storage
 constexpr const char *APP_DIRECTORY_ARGUMENT = "--app-directory";
@@ -560,16 +581,22 @@ bool exit_shortcut_held() {
 
 // Starts the title again with no game to boot, which is the game list
 [[noreturn]] void return_to_game_list() {
+#ifdef EMUHUB_EMBEDDED_VITA
+    LOG_INFO("Returning to the selected EmuHub Vita row");
+    logging::flush();
+    return_to_emuhub_now();
+#else
     LOG_INFO("Restarting into the game list");
     logging::flush();
     platform::notify("Vita3K: returning to the game list");
     // An empty list, not a null one: the shell refuses the call without somewhere to read the arguments from
     const char *const arguments[] = { NO_SPLASH_ARGUMENT, nullptr };
-    const int refused = sceSystemServiceLoadExec("/app0/eboot.bin", arguments);
+    const int refused = sceSystemServiceLoadExec(THIS_EXECUTABLE, arguments);
     LOG_ERROR("The system refused to restart the title: 0x{:X}", static_cast<unsigned>(refused));
     // LoadExec does not return on success; park rather than run on with a stopped session
     for (;;)
         sceKernelUsleep(100000);
+#endif
 }
 
 // The front end has nothing to draw while a game runs, so it idles at roughly a frame between polls
@@ -603,7 +630,12 @@ constexpr int FRAME_INTERVAL_MS = 16;
         arguments.push_back(argument.c_str());
     arguments.push_back(nullptr);
 
-    const int refused = sceSystemServiceLoadExec("/app0/eboot.bin", arguments.data());
+#ifdef EMUHUB_EMBEDDED_VITA
+    if (!active_emuhub_request || launch_request.app_path != active_emuhub_request->title_id ||
+        !emuhub_vita::arm(EMUHUB_TICKET, EMUHUB_MARKER, *active_emuhub_request))
+        return_to_emuhub_now();
+#endif
+    const int refused = sceSystemServiceLoadExec(THIS_EXECUTABLE, arguments.data());
     LOG_ERROR("The system refused to restart the title: 0x{:X}", static_cast<unsigned>(refused));
     // LoadExec does not return on success; park rather than run on with a session that is about to be torn down
     for (;;)
@@ -804,18 +836,108 @@ int run_front_end(EmuEnvState &emuenv, const Root &root_paths, const fs::path &s
 
 } // namespace
 
+
+#ifdef EMUHUB_EMBEDDED_VITA
+// Check a ZIP's bounded central directory and only its small SFO before any install writes.
+// The work.bin member is checked by name, never read or logged by this preflight.
+bool embedded_archive_matches(const emuhub_vita::Request &request, int language) {
+    FILE *file = FOPEN(request.zip_path.c_str(), "rb");
+    if (!file) return false;
+    mz_zip_archive archive{};
+    if (!mz_zip_reader_init_cfile(&archive, file, 0, 0)) { std::fclose(file); return false; }
+    bool okay = false;
+    const mz_uint count = mz_zip_reader_get_num_files(&archive);
+    if (count > 0 && count <= 8192) {
+        std::set<std::string> names;
+        mz_uint sfo_index = count;
+        bool safe = true;
+        for (mz_uint i = 0; i < count; ++i) {
+            mz_zip_archive_file_stat info{};
+            if (!mz_zip_reader_file_stat(&archive, i, &info)) { safe = false; break; }
+            const std::string name = info.m_filename;
+            if (name.empty() || name.front() == '/' || name.find('\\') != std::string::npos ||
+                name.find("../") != std::string::npos || name.find("/..") != std::string::npos ||
+                !names.insert(name).second || name == "sce_module/steroid.suprx" ||
+                (name.size() > 17 && name.ends_with("sce_sys/param.sfo") && name != "sce_sys/param.sfo")) {
+                safe = false; break;
+            }
+            if (name == "sce_sys/param.sfo") {
+                if (info.m_uncomp_size == 0 || info.m_uncomp_size > 8192) { safe = false; break; }
+                sfo_index = i;
+            }
+        }
+        if (safe && sfo_index != count && names.contains("eboot.bin") &&
+            names.contains("sce_sys/package/work.bin")) {
+            mz_zip_archive_file_stat info{};
+            if (mz_zip_reader_file_stat(&archive, sfo_index, &info)) {
+                vfs::FileBuffer sfo_bytes(static_cast<std::size_t>(info.m_uncomp_size));
+                if (mz_zip_reader_extract_to_mem(&archive, sfo_index, sfo_bytes.data(), sfo_bytes.size(), 0)) {
+                    sfo::SfoAppInfo app_info{};
+                    sfo::get_param_info(app_info, sfo_bytes, language);
+                    okay = app_info.app_title_id == request.title_id;
+                }
+            }
+        }
+    }
+    mz_zip_reader_end(&archive);
+    std::fclose(file);
+    return okay;
+}
+
+bool prepare_embedded_game(EmuEnvState &emuenv, const emuhub_vita::Request &request) {
+    const fs::path app_dir = device::app_directory(emuenv.vita_fs_path, request.title_id);
+    if (is_vita_app(app_dir)) return true; // Preserve installed game and save state.
+    if (fs::exists(app_dir)) return false; // Refuse to replace a partial or sealed install.
+    const fs::path archive_path(request.zip_path);
+    boost::system::error_code error;
+    const std::uintmax_t archive_size = fs::file_size(archive_path, error);
+    if (error || archive_size == 0 || archive_size > (16ull << 30)) return false;
+    const auto capacity = fs::space(emuenv.vita_fs_path, error);
+    if (error || capacity.available < archive_size * 2 + (1ull << 30)) return false;
+    if (!embedded_archive_matches(request, emuenv.cfg.sys_lang)) return false;
+    LOG_INFO("Installing selected Vita title {} from verified prepared ZIP", request.title_id);
+    const auto contents = install_archive(emuenv, archive_path, nullptr,
+        [](const std::string &, const std::string &) { return false; });
+    // The archive stays in EmuHub's cache. Never invoke the upstream UI's
+    // install_package cleanup, which deletes a package after import.
+    if (contents.size() != 1 || !contents.front().state ||
+        contents.front().title_id != request.title_id || !is_vita_app(app_dir)) return false;
+    app::init_apps_list(emuenv);
+    return true;
+}
+#endif
+
 int main(int argc, char *argv[]) {
+#ifdef EMUHUB_EMBEDDED_VITA
+    emuhub_vita::Request selected;
+    if (!emuhub_vita::consume(EMUHUB_TICKET, EMUHUB_MARKER, selected))
+        return_to_emuhub_now();
+    active_emuhub_request = selected;
+#endif
     const std::unique_ptr<platform::PlatformInterface> runtime = platform::create_platform();
     const bool stderr_captured = runtime->initialize();
     const platform::RuntimeConfig runtime_cfg = runtime->config();
+#ifdef EMUHUB_EMBEDDED_VITA
+    // Refuse sandbox fallback: it would hide installs/saves from EmuHub and FTP.
+    if (runtime_cfg.save_directory != "/data/emuhub/vita3k") return_to_emuhub_now();
+#endif
 
     Root root_paths;
     app::init_paths(root_paths, &runtime_cfg);
-    if (!create_directories(root_paths))
+    if (!create_directories(root_paths)) {
+#ifdef EMUHUB_EMBEDDED_VITA
+        return_to_emuhub_now();
+#else
         return InitConfigFailed;
+#endif
+    }
     if (logging::init(root_paths, true) != Success) {
         std::fprintf(stderr, "cannot start logging in %s\n", root_paths.get_log_path().string().c_str());
+#ifdef EMUHUB_EMBEDDED_VITA
+        return_to_emuhub_now();
+#else
         return InitConfigFailed;
+#endif
     }
 
     report_crypto_speed();
@@ -842,23 +964,38 @@ int main(int argc, char *argv[]) {
         LOG_WARN("The log does not reach klog, only {}", root_paths.get_log_path());
     for (int i = 0; i < argc; i++)
         LOG_INFO("Argument {}: {}", i, argv[i]);
+#ifndef EMUHUB_EMBEDDED_VITA
     const std::string boot_title_id = argument_value(argc, argv, BOOT_ARGUMENT);
     const bool show_splash = std::none_of(argv, argv + argc, [](const char *argument) {
         return argument && std::string_view(argument) == NO_SPLASH_ARGUMENT;
     });
+#endif
 
-    // SDL has no PS5 audio driver, and it never picks its silent dummy driver on its own. Until audio goes to
-    // sceAudioOut, ask for the dummy so the rest of the emulator starts
+    // SDL has no PS5 audio driver; the dummy only lets SDL initialize input.
+    // Emulated game audio uses Ps5AudioAdapter and sceAudioOut directly.
     SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
     if (!SDL_Init(SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         LOG_ERROR("SDL_Init failed: {}", SDL_GetError());
+#ifdef EMUHUB_EMBEDDED_VITA
+        return_to_emuhub_now();
+#else
         return InitConfigFailed;
+#endif
     }
 
     int exit_code = InitConfigFailed;
     {
         auto emuenv = std::make_unique<EmuEnvState>();
         if (initialize_emulator(*emuenv, root_paths)) {
+#ifdef EMUHUB_EMBEDDED_VITA
+            if (prepare_embedded_game(*emuenv, selected)) {
+                refresh_controllers(emuenv->ctrl, *emuenv);
+                exit_code = run_app(*emuenv, selected.title_id, argument_value(argc, argv, SELF_ARGUMENT),
+                    argument_values(argc, argv, SELF_ARG_ARGUMENT));
+            } else {
+                LOG_ERROR("Selected Vita title {} could not be safely prepared", selected.title_id);
+            }
+#else
             if (boot_title_id.empty()) {
                 exit_code = run_front_end(*emuenv, root_paths, runtime_cfg.save_directory, show_splash);
             } else {
@@ -869,10 +1006,16 @@ int main(int argc, char *argv[]) {
                 exit_code = run_app(*emuenv, boot_title_id, argument_value(argc, argv, SELF_ARGUMENT),
                     argument_values(argc, argv, SELF_ARG_ARGUMENT));
             }
+#endif
         }
     }
 
     SDL_Quit();
     runtime->shutdown();
+#ifdef EMUHUB_EMBEDDED_VITA
+    (void)exit_code;
+    return_to_emuhub_now();
+#else
     return exit_code;
+#endif
 }

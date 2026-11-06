@@ -11,6 +11,13 @@ project(Vita3K)
 
 # Set by cmake/ps5-payload.cmake, the toolchain for the PS5 payload SDK
 option(VITA3K_PS5_PORT "Build Vita3K for the PS5" OFF)
+option(EMUHUB_EMBEDDED_VITA "Build PS5 Vita3K inside the EmuHub title" OFF)
+if(EMUHUB_EMBEDDED_VITA)
+    if(NOT VITA3K_PS5_PORT)
+        message(FATAL_ERROR "EMUHUB_EMBEDDED_VITA requires VITA3K_PS5_PORT")
+    endif()
+    add_compile_definitions(EMUHUB_EMBEDDED_VITA=1)
+endif()
 
 # Detects the amount of processors of the host machine and forwards the result to CPU_COUNT
 include(ProcessorCount)

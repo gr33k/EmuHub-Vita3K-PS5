@@ -70,7 +70,13 @@ using hui::gfx::Color;
 using hui::gfx::DrawList;
 using hui::gfx::Rect;
 
+#ifdef EMUHUB_EMBEDDED_VITA
+constexpr const char *FONT_DIRECTORY = "/app0/providers/vita/assets/hui/fonts";
+constexpr const char *SPLASH_IMAGE = "/app0/providers/vita/assets/home/splash.png";
+#else
 constexpr const char *FONT_DIRECTORY = "/app0/assets/hui/fonts";
+constexpr const char *SPLASH_IMAGE = "/app0/assets/home/splash.png";
+#endif
 // In ui::Fonts order, as the kit bakes them
 constexpr const char *FONT_FILES[6] = {
     "inter-regular.huifont",
@@ -85,7 +91,6 @@ constexpr std::string_view THEME_ID = "tiles";
 
 constexpr float MARGIN = 120.0f;
 // The splash, as the shell shows it (from tools/ps5/make-title-art.py): held, then faded into the home screen
-constexpr const char *SPLASH_IMAGE = "/app0/assets/home/splash.png";
 constexpr float SPLASH_HOLD_US = 1200000.0f;
 constexpr float SPLASH_FADE_US = 400000.0f;
 // The library, as the PS Vita's home screen: ten bubbles to a page in rows of three, four and three

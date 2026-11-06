@@ -18,6 +18,17 @@ if(NOT EXISTS "${PS5_UI_KIT}/.revision" OR NOT EXISTS "${PS5_UI_KIT}/src/gfx/vk/
 		execute_process(COMMAND git clone --quiet --bare https://github.com/mihawk-99/PS5_VKHomebrewUI.git "${PS5_UI_KIT_GIT}"
 			RESULT_VARIABLE PS5_UI_RESULT)
 	endif()
+	# The pinned revision may no longer be reachable from the default branch.
+	# Fetch that exact object before archiving; never substitute another revision.
+	execute_process(COMMAND git -C "${PS5_UI_KIT_GIT}" cat-file -e "${PS5_UI_KIT_REVISION}^{commit}"
+		RESULT_VARIABLE PS5_UI_PIN_PRESENT OUTPUT_QUIET ERROR_QUIET)
+	if(NOT PS5_UI_PIN_PRESENT EQUAL 0)
+		execute_process(COMMAND git -C "${PS5_UI_KIT_GIT}" fetch --no-tags origin "${PS5_UI_KIT_REVISION}"
+			RESULT_VARIABLE PS5_UI_PIN_FETCH)
+		if(NOT PS5_UI_PIN_FETCH EQUAL 0)
+			message(FATAL_ERROR "Could not fetch pinned PS5_VKHomebrewUI ${PS5_UI_KIT_REVISION}")
+		endif()
+	endif()
 	file(REMOVE_RECURSE "${PS5_UI_KIT}")
 	file(MAKE_DIRECTORY "${PS5_UI_KIT}")
 	execute_process(

@@ -69,7 +69,13 @@ constexpr unsigned int JAILBREAK_POLL_US = 16667;
 constexpr int JAILBREAK_CONSUME_POLLS = 600;
 constexpr int JAILBREAK_SETTLE_POLLS = 450;
 
+#ifdef EMUHUB_EMBEDDED_VITA
+constexpr const char *DATA_DIRECTORY = "/data/emuhub/vita3k";
+constexpr const char *STATIC_ASSETS_DIRECTORY = "/app0/providers/vita";
+#else
 constexpr const char *DATA_DIRECTORY = "/data/Vita3K";
+constexpr const char *STATIC_ASSETS_DIRECTORY = "/app0";
+#endif
 // The title's own storage, which the sandbox always allows
 constexpr const char *SANDBOX_DIRECTORY = "/download0/Vita3K";
 
@@ -295,7 +301,7 @@ public:
         return RuntimeConfig{
             .kind = PlatformKind::PS5,
             .app_name = "Vita3K",
-            .static_assets_directory = "/app0",
+            .static_assets_directory = STATIC_ASSETS_DIRECTORY,
             .save_directory = save_directory,
         };
     }
@@ -312,10 +318,12 @@ public:
             std::fprintf(stderr, "running sandboxed: files go to %s, which other apps cannot reach\n", SANDBOX_DIRECTORY);
         }
         std::fprintf(stderr, "save directory: %s\n", save_directory.c_str());
+#ifndef EMUHUB_EMBEDDED_VITA
         probe_file_removal(save_directory);
         probe_removal_by_subtree(save_directory);
         probe_mounts();
         probe_storage_speed(save_directory);
+#endif
         return klog;
     }
 
